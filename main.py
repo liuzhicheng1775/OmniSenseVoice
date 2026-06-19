@@ -1,0 +1,465 @@
+#!/usr/bin/env python3
+
+"""
+=== OmniSenseVoice v2.1 (Sherpa-ONNX + SenseVoice) ===
+跨平台语音输入工具：按住 F9 或 F5 录音，松开后自动识别并粘贴到光标位置。
+平台：macOS / Linux / Windows 10/11
+用法：
+  python3 main.py            # 正常启动
+  python3 main.py --select   # 重新选择模型
+"""
+
+import os
+import sys
+import subprocess
+import time
+import re
+import platform
+import shutil
+import json
+import tempfile
+from pathlib import Path
+
+# ============================================================
+#  1. 依赖自检与自动安装
+# ============================================================
+def ensure_dependencies():
+    required = {
+        "pynput": "pynput",
+        "pyperclip": "pyperclip",
+        "sherpa_onnx": "sherpa-onnx",
+        "numpy": "numpy",
+        "soundfile": "soundfile",
+    }
+    # Windows 需要额外的纯 Python 录音库（避免依赖 sox）
+    if platform.system() == "Windows":
+        required["sounddevice"] = "sounddevice"
+
+    missing = []
+    for module, package in required.items():
+        try:
+            __import__(module)
+        except ImportError:
+            missing.append(package)
+
+    if missing:
+        print(f"[!] 发现缺失组件: {', '.join(missing)}")
+        print("[-] 正在自动安装，请稍候...")
+        try:
+            subprocess.check_call([sys.executable, "-m", "pip", "install", *missing])
+            print("[+] 安装完成，正在重启脚本...")
+            os.execv(sys.executable, [sys.executable] + sys.argv)
+        except Exception as e:
+            print(f"[错误] 自动安装失败: {e}")
+            print(f"请手动执行: pip3 install {' '.join(missing)}")
+            sys.exit(1)
+
+ensure_dependencies()
+
+from pynput import keyboard
+import pyperclip
+import numpy as np
+import soundfile as sf
+import sherpa_onnx
+
+# ============================================================
+#  2. 平台检测与路径配置
+# ============================================================
+OS_TYPE = platform.system()
+BASE_DIR = Path(__file__).parent.absolute()
+MODEL_DIR = BASE_DIR / "sensevoice-models"
+CONFIG_FILE = BASE_DIR / ".sensevoice_config.json"  # 记住上次选择
+AUDIO_FILE = os.path.join(tempfile.gettempdir(), "sensevoice_temp.wav")
+SAMPLE_RATE = 16000
+
+if OS_TYPE == "Darwin":
+    REC_BIN = shutil.which("rec") or "/opt/homebrew/bin/rec"
+elif OS_TYPE == "Linux":
+    REC_BIN = shutil.which("rec") or "/usr/bin/rec"
+elif OS_TYPE == "Windows":
+    REC_BIN = None  # Windows 用 sounddevice，不依赖 sox
+else:
+    print("[!] 不支持的操作系统:", OS_TYPE)
+    sys.exit(1)
+
+# ============================================================
+#  3. 系统依赖检查
+# ============================================================
+def check_system_deps():
+    if OS_TYPE == "Windows":
+        # Windows 不需要额外系统依赖，sounddevice 自带 PortAudio
+        return
+
+    if OS_TYPE == "Darwin":
+        if not shutil.which("rec") and not Path("/opt/homebrew/bin/rec").exists():
+            print("\n[!] 缺少系统依赖: sox")
+            if not shutil.which("brew"):
+                print("请先安装 Homebrew:")
+                print('  /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"')
+            print("然后执行: brew install sox")
+            sys.exit(1)
+
+    elif OS_TYPE == "Linux":
+        needed = ["sox", "xdotool", "xclip"]
+        missing = [b for b in needed if not shutil.which(b)]
+        if missing:
+            print(f"\n[!] 缺少系统依赖: {', '.join(missing)}")
+            if os.geteuid() != 0:
+                print("=========================================================")
+                print("⚠️  请使用 sudo 运行一次以自动安装系统依赖:")
+                print(f"   sudo {sys.executable} {__file__}")
+                print("=========================================================")
+                sys.exit(1)
+            else:
+                print("[-] 正在自动安装系统依赖...")
+                subprocess.run(
+                    "apt-get update && apt-get install -y sox xdotool xclip wget",
+                    shell=True, check=True
+                )
+                print("[+] 系统依赖安装完成。")
+
+# ============================================================
+#  4. 模型配置
+# ============================================================
+MODEL_PACKAGE = {
+    "url": "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17.tar.bz2",
+    "subdir": "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17",
+}
+
+MODEL_OPTIONS = {
+    "1": {
+        "name": "int8 量化版",
+        "file": "model.int8.onnx",
+        "ram": "~230 MB",
+        "speed": "⚡ 极快",
+        "desc": "推荐，精度几乎无损，速度最快",
+    },
+    "2": {
+        "name": "原版精度",
+        "file": "model.onnx",
+        "ram": "~900 MB",
+        "speed": "⚡ 快",
+        "desc": "最高精度，内存占用较大",
+    },
+}
+
+# ============================================================
+#  5. 配置读写（记住上次选择）
+# ============================================================
+def load_config():
+    if CONFIG_FILE.exists():
+        try:
+            with open(CONFIG_FILE, "r") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+def save_config(data: dict):
+    try:
+        with open(CONFIG_FILE, "w") as f:
+            json.dump(data, f, indent=2)
+    except Exception as e:
+        print(f"[警告] 配置保存失败: {e}")
+
+# ============================================================
+#  6. 模型下载
+# ============================================================
+def download_model_package():
+    """下载并解压模型包（含两个模型文件）"""
+    model_path = MODEL_DIR / MODEL_PACKAGE["subdir"]
+    if model_path.exists():
+        return model_path
+
+    print("\n[*] 需要下载 SenseVoice 模型包（~999MB，含 int8 和原版两个模型）")
+    input("    按 Enter 开始下载，Ctrl+C 取消...")
+
+    os.makedirs(MODEL_DIR, exist_ok=True)
+    tar_file = str(MODEL_DIR / "model.tar.bz2")
+
+    try:
+        if shutil.which("wget"):
+            subprocess.run(
+                ["wget", "--progress=bar:force", "-O", tar_file, MODEL_PACKAGE["url"]],
+                check=True
+            )
+        elif shutil.which("curl"):
+            subprocess.run(
+                ["curl", "-L", "--progress-bar", "-o", tar_file, MODEL_PACKAGE["url"]],
+                check=True
+            )
+        else:
+            print("[错误] 未找到 wget 或 curl，请安装其中之一。")
+            sys.exit(1)
+
+        print("[*] 正在解压模型包...")
+        subprocess.run(["tar", "xjf", tar_file, "-C", str(MODEL_DIR)], check=True)
+        os.remove(tar_file)
+        print("[+] 模型包解压完成！\n")
+
+    except KeyboardInterrupt:
+        print("\n[!] 下载已取消。")
+        if os.path.exists(tar_file):
+            os.remove(tar_file)
+        sys.exit(0)
+    except Exception as e:
+        print(f"[错误] 下载失败: {e}")
+        print(f"请手动下载: {MODEL_PACKAGE['url']}")
+        print(f"并解压到: {MODEL_DIR}/")
+        sys.exit(1)
+
+    return model_path
+
+# ============================================================
+#  7. 模型选择（含记忆功能）
+# ============================================================
+def show_model_menu():
+    """显示模型选择菜单，返回用户选择的 key"""
+    print()
+    print("╔══════════════════════════════════════════════════╗")
+    print("║         选择要加载的 SenseVoice 模型             ║")
+    print("║         （两个模型已包含在同一下载包中）          ║")
+    print("╠══════════════════════════════════════════════════╣")
+    for k, v in MODEL_OPTIONS.items():
+        print(f"║  {k}. {v['name']}")
+        print(f"║     内存: {v['ram']}  速度: {v['speed']}")
+        print(f"║     {v['desc']}")
+        print("║")
+    print("╚══════════════════════════════════════════════════╝")
+
+    while True:
+        choice = input("\n请选择 [1/2]: ").strip()
+        if choice in MODEL_OPTIONS:
+            return choice
+        print("[!] 无效选择，请输入 1 或 2。")
+
+def setup_model(force_select: bool = False):
+    """
+    模型管理主函数：
+    - 首次运行：下载 → 选择 → 记住
+    - 后续运行：直接加载上次的选择
+    - force_select=True：重新选择（--select 参数触发）
+    """
+    config = load_config()
+
+    # 确保模型包已下载
+    model_path = download_model_package()
+
+    # 判断是否需要重新选择
+    saved_choice = config.get("model_choice")
+    need_select = force_select or (saved_choice not in MODEL_OPTIONS)
+
+    if need_select:
+        if force_select:
+            print("\n[*] 重新选择模型（--select 模式）")
+        else:
+            print("\n[*] 首次运行，请选择要加载的模型。")
+
+        choice = show_model_menu()
+        config["model_choice"] = choice
+        save_config(config)
+    else:
+        choice = saved_choice
+        print(f"[状态]: 加载上次选择的模型 -> {MODEL_OPTIONS[choice]['name']}")
+        print(f"        （如需更换，请加 --select 参数重新运行）")
+
+    selected = MODEL_OPTIONS[choice]
+    return str(model_path), selected["file"], selected["name"]
+
+# ============================================================
+#  8. 创建 Sherpa-ONNX 识别器
+# ============================================================
+def create_recognizer(model_path: str, model_file: str):
+    recognizer = sherpa_onnx.OfflineRecognizer.from_sense_voice(
+        model=os.path.join(model_path, model_file),
+        tokens=os.path.join(model_path, "tokens.txt"),
+        num_threads=max(2, os.cpu_count() - 2),
+        use_itn=True,
+        language="auto",
+        debug=False,
+    )
+    return recognizer
+
+# ============================================================
+#  9. 录音控制
+# ============================================================
+is_recording = False
+record_process = None       # Linux/macOS: sox 子进程
+sd_stream = None            # Windows: sounddevice 输入流
+sd_buffer = []              # Windows: 录音帧累积
+
+def start_recording():
+    global is_recording, record_process, sd_stream, sd_buffer
+    if is_recording:
+        return
+    is_recording = True
+    if os.path.exists(AUDIO_FILE):
+        try:
+            os.remove(AUDIO_FILE)
+        except OSError:
+            pass
+    print("\r🎙️  [录音中...] 松开按键停止          ", end="", flush=True)
+
+    if OS_TYPE == "Windows":
+        # Windows 走 sounddevice：开一个输入流，把帧塞到缓冲区
+        import sounddevice as sd
+        sd_buffer = []
+
+        def _callback(indata, frames, time_info, status):
+            sd_buffer.append(indata.copy())
+
+        sd_stream = sd.InputStream(
+            samplerate=SAMPLE_RATE,
+            channels=1,
+            dtype="float32",
+            callback=_callback,
+        )
+        sd_stream.start()
+    else:
+        # Linux/macOS 维持原有 sox 流程
+        record_process = subprocess.Popen(
+            [REC_BIN, "-q", "-r", str(SAMPLE_RATE), "-c", "1", "-b", "16", AUDIO_FILE, "rate", "16k"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+def stop_recording_and_transcribe(recognizer):
+    global is_recording, record_process, sd_stream, sd_buffer
+    if not is_recording:
+        return
+
+    print("\r⏳ [正在识别...]                        ", end="", flush=True)
+    is_recording = False
+
+    if OS_TYPE == "Windows":
+        # 停流，把累积的帧拼起来写入 wav
+        if sd_stream is not None:
+            try:
+                sd_stream.stop()
+                sd_stream.close()
+            except Exception:
+                pass
+            sd_stream = None
+
+        if sd_buffer:
+            audio_concat = np.concatenate(sd_buffer, axis=0).reshape(-1).astype(np.float32)
+            try:
+                sf.write(AUDIO_FILE, audio_concat, SAMPLE_RATE, subtype="PCM_16")
+            except Exception as e:
+                print(f"\n[错误] 写入临时音频失败: {e}")
+        sd_buffer = []
+    else:
+        if record_process:
+            record_process.terminate()
+            record_process.wait()
+            record_process = None
+
+    try:
+        start_t = time.time()
+
+        if not os.path.exists(AUDIO_FILE):
+            print("\r[提示]: 未检测到音频文件。              ")
+            return
+
+        audio_data, sr = sf.read(AUDIO_FILE, dtype="float32")
+
+        if len(audio_data) < sr * 0.3:
+            print("\r[提示]: 录音太短，已跳过。              ")
+            return
+
+        # 确保单声道
+        if len(audio_data.shape) > 1:
+            audio_data = audio_data[:, 0]
+
+        # 重采样（如有需要）
+        if sr != SAMPLE_RATE:
+            new_len = int(len(audio_data) * SAMPLE_RATE / sr)
+            audio_data = np.interp(
+                np.linspace(0, len(audio_data) - 1, new_len),
+                np.arange(len(audio_data)),
+                audio_data,
+            ).astype(np.float32)
+
+        # 识别
+        stream = recognizer.create_stream()
+        stream.accept_waveform(SAMPLE_RATE, audio_data)
+        recognizer.decode_stream(stream)
+
+        text = stream.result.text.strip()
+        elapsed = time.time() - start_t
+
+        # 清理 SenseVoice 特殊标签（如 <|zh|><|NEUTRAL|><|Speech|>）
+        clean_text = re.sub(r'<\|[^>]*\|>', '', text).strip()
+
+        if clean_text:
+            print(f"\r[结果]: {clean_text}")
+            print(f"[耗时]: {elapsed:.2f} 秒")
+            pyperclip.copy(clean_text)
+            if OS_TYPE == "Darwin":
+                subprocess.run([
+                    "osascript", "-e",
+                    'tell application "System Events" to keystroke "v" using command down'
+                ])
+            elif OS_TYPE == "Linux":
+                subprocess.run(["xdotool", "key", "ctrl+v"])
+            elif OS_TYPE == "Windows":
+                # 用 pynput 直接模拟 Ctrl+V，跨平台、零外部依赖
+                kb = keyboard.Controller()
+                with kb.pressed(keyboard.Key.ctrl):
+                    kb.press('v')
+                    kb.release('v')
+        else:
+            print("\r[提示]: 未检测到有效语音。              ")
+
+    except Exception as e:
+        print(f"\n[错误]: {e}")
+    finally:
+        if os.path.exists(AUDIO_FILE):
+            try:
+                os.remove(AUDIO_FILE)
+            except OSError:
+                pass
+
+# ============================================================
+#  10. 主程序
+# ============================================================
+def main():
+    force_select = "--select" in sys.argv
+
+    print("=" * 52)
+    print("  OmniSenseVoice v2.1 (Sherpa-ONNX + SenseVoice)")
+    print(f"  平台: {OS_TYPE}")
+    print("=" * 52)
+
+    check_system_deps()
+
+    model_path, model_file, model_name = setup_model(force_select=force_select)
+
+    print(f"\n[*] 正在加载模型: {model_name} ...")
+    recognizer = create_recognizer(model_path, model_file)
+    print("[+] 模型加载完成！")
+
+    print()
+    print("┌────────────────────────────────────────────────┐")
+    print("│  ✅ 系统已就绪                                  │")
+    print("│  🎙️  按住 F5 或 F9 录音，松开自动粘贴文本         │")
+    print("│  🔄 换模型: python3 main.py --select      │")
+    print("│  ❌ 退出: Ctrl+C                                │")
+    print("└────────────────────────────────────────────────┘")
+    print()
+
+    def on_press(key):
+        # 同时监听 F9 和 F5
+        if key in (keyboard.Key.f9, keyboard.Key.f5):
+            start_recording()
+
+    def on_release(key):
+        # 对应释放逻辑
+        if key in (keyboard.Key.f9, keyboard.Key.f5):
+            stop_recording_and_transcribe(recognizer)
+
+    with keyboard.Listener(on_press=on_press, on_release=on_release) as listener:
+        listener.join()
+
+if __name__ == "__main__":
+    main()

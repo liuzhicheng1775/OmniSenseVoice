@@ -1,0 +1,11 @@
+# Ignore model files
+sensevoice-models/
+*.onnx
+
+# Ignore local config
+.sensevoice_config.json
+
+# Python stuff
+__pycache__/
+*.py[cod]
+.DS_Store

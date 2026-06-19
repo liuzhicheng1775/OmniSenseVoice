@@ -1,0 +1,6 @@
+pynput
+pyperclip
+numpy
+soundfile
+sherpa-onnx
+sounddevice ; sys_platform == "win32"
