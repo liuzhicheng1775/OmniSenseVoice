@@ -66,9 +66,32 @@ import sherpa_onnx
 #  2. 平台检测与路径配置
 # ============================================================
 OS_TYPE = platform.system()
+
+
+def get_app_data_dir() -> Path:
+    """
+    返回用户数据目录（跨平台、可写）。
+    - Windows: %APPDATA%\\OmniSenseVoice
+    - macOS:   ~/Library/Application Support/OmniSenseVoice
+    - Linux:   ~/.OmniSenseVoice
+    打包成 exe 后，脚本所在目录可能是只读的（OneDir 模式还行，OneFile 模式必读），
+    所以模型和配置都放用户目录里。
+    """
+    if OS_TYPE == "Windows":
+        base = os.environ.get("APPDATA") or os.path.expanduser("~")
+        return Path(base) / "OmniSenseVoice"
+    elif OS_TYPE == "Darwin":
+        return Path.home() / "Library" / "Application Support" / "OmniSenseVoice"
+    else:
+        return Path.home() / ".OmniSenseVoice"
+
+
+APP_DATA_DIR = get_app_data_dir()
+APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
+
 BASE_DIR = Path(__file__).parent.absolute()
-MODEL_DIR = BASE_DIR / "sensevoice-models"
-CONFIG_FILE = BASE_DIR / ".sensevoice_config.json"  # 记住上次选择
+MODEL_DIR = APP_DATA_DIR / "sensevoice-models"
+CONFIG_FILE = APP_DATA_DIR / ".sensevoice_config.json"  # 记住上次选择
 AUDIO_FILE = os.path.join(tempfile.gettempdir(), "sensevoice_temp.wav")
 SAMPLE_RATE = 16000
 
@@ -165,35 +188,61 @@ def save_config(data: dict):
 # ============================================================
 #  6. 模型下载
 # ============================================================
+import urllib.request
+import tarfile
+
+
+def _download_with_progress(url: str, dst: str):
+    """
+    用标准库 urllib 下载文件，带进度条。
+    不依赖 wget/curl，打包成 exe 后也能工作。
+    """
+    req = urllib.request.Request(url, headers={"User-Agent": "OmniSenseVoice/2.1"})
+    with urllib.request.urlopen(req) as resp:
+        total = int(resp.headers.get("Content-Length", 0))
+        downloaded = 0
+        chunk = 1024 * 64  # 64 KB
+        last_pct = -1
+        with open(dst, "wb") as f:
+            while True:
+                data = resp.read(chunk)
+                if not data:
+                    break
+                f.write(data)
+                downloaded += len(data)
+                if total > 0:
+                    pct = downloaded * 100 // total
+                    if pct != last_pct:
+                        bar_len = 40
+                        filled = bar_len * pct // 100
+                        bar = "█" * filled + "-" * (bar_len - filled)
+                        size_mb = downloaded / 1024 / 1024
+                        total_mb = total / 1024 / 1024
+                        print(f"\r[{bar}] {pct:3d}%  {size_mb:.1f}/{total_mb:.1f} MB", end="", flush=True)
+                        last_pct = pct
+        print()  # 换行
+
+
 def download_model_package():
     """下载并解压模型包（含两个模型文件）"""
     model_path = MODEL_DIR / MODEL_PACKAGE["subdir"]
     if model_path.exists():
         return model_path
 
-    print("\n[*] 需要下载 SenseVoice 模型包（~999MB，含 int8 和原版两个模型）")
+    print(f"\n[*] 需要下载 SenseVoice 模型包（~999MB，含 int8 和原版两个模型）")
+    print(f"    存储位置: {MODEL_DIR}")
     input("    按 Enter 开始下载，Ctrl+C 取消...")
 
     os.makedirs(MODEL_DIR, exist_ok=True)
     tar_file = str(MODEL_DIR / "model.tar.bz2")
 
     try:
-        if shutil.which("wget"):
-            subprocess.run(
-                ["wget", "--progress=bar:force", "-O", tar_file, MODEL_PACKAGE["url"]],
-                check=True
-            )
-        elif shutil.which("curl"):
-            subprocess.run(
-                ["curl", "-L", "--progress-bar", "-o", tar_file, MODEL_PACKAGE["url"]],
-                check=True
-            )
-        else:
-            print("[错误] 未找到 wget 或 curl，请安装其中之一。")
-            sys.exit(1)
+        print(f"[*] 正在从 {MODEL_PACKAGE['url']} 下载...")
+        _download_with_progress(MODEL_PACKAGE["url"], tar_file)
 
         print("[*] 正在解压模型包...")
-        subprocess.run(["tar", "xjf", tar_file, "-C", str(MODEL_DIR)], check=True)
+        with tarfile.open(tar_file, "r:bz2") as tar:
+            tar.extractall(MODEL_DIR)
         os.remove(tar_file)
         print("[+] 模型包解压完成！\n")
 
@@ -203,7 +252,7 @@ def download_model_package():
             os.remove(tar_file)
         sys.exit(0)
     except Exception as e:
-        print(f"[错误] 下载失败: {e}")
+        print(f"\n[错误] 下载失败: {e}")
         print(f"请手动下载: {MODEL_PACKAGE['url']}")
         print(f"并解压到: {MODEL_DIR}/")
         sys.exit(1)
@@ -439,11 +488,19 @@ def main():
     recognizer = create_recognizer(model_path, model_file)
     print("[+] 模型加载完成！")
 
+    # 判断是否打包模式（PyInstaller 打包后 sys.frozen=True）
+    is_frozen = getattr(sys, "frozen", False)
+    if is_frozen:
+        exe_name = os.path.basename(sys.executable)
+        select_hint = f"  🔄 换模型: {exe_name} --select   "
+    else:
+        select_hint = "  🔄 换模型: python3 main.py --select"
+
     print()
     print("┌────────────────────────────────────────────────┐")
     print("│  ✅ 系统已就绪                                  │")
     print("│  🎙️  按住 F5 或 F9 录音，松开自动粘贴文本         │")
-    print("│  🔄 换模型: python3 main.py --select      │")
+    print(f"│{select_hint:<48}│")
     print("│  ❌ 退出: Ctrl+C                                │")
     print("└────────────────────────────────────────────────┘")
     print()

@@ -9,3 +9,17 @@ sensevoice-models/
 __pycache__/
 *.py[cod]
 .DS_Store
+
+# PyInstaller 产物
+build/
+dist/
+*.spec.bak
+
+# 虚拟环境
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/

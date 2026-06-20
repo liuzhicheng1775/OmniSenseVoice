@@ -19,30 +19,60 @@
 
 ## 🚀 安装与运行
 
+### 🪟 Windows 10 / 11 用户（推荐：直接下载 .exe）
+
+1. 去 [Releases 页面](https://github.com/liuzhicheng1775/OmniSenseVoice/releases) 下载最新的 `OmniSenseVoice-vX.X.X-win64.zip`
+2. 解压到任意目录
+3. 双击 `OmniSenseVoice.exe` 运行
+
+首次启动会自动下载模型（约 999MB，存到 `%APPDATA%\OmniSenseVoice\`，只下一次），并让你选择模型精度。
+
+**首次按 F9 录音时若 Windows 要求麦克风权限**，去「设置 → 隐私 → 麦克风」打开"允许桌面应用访问麦克风"。
+
+> 💡 如果某些以管理员身份运行的软件（如管理员模式的 cmd）粘贴失效，请右键 `OmniSenseVoice.exe` 选择**「以管理员身份运行」**。这是 Windows UAC 的隔离机制，不是程序问题。
+>
+> ⚠️ 杀软可能误报（因为 PyInstaller 打包 + 全局键盘监听），把 exe 加白名单即可。
+
+### 💻 开发者：从源码运行
+
 克隆本仓库到本地：
 ```bash
-git clone <你的仓库地址>/OmniSenseVoice.git
+git clone https://github.com/liuzhicheng1775/OmniSenseVoice.git
 cd OmniSenseVoice
 ```
 
-### 🪟 Windows 10 / 11 用户指南
+#### 🪟 Windows（源码模式）
 
 **前置要求**：Python 3.9 ~ 3.12（[python.org](https://www.python.org/downloads/windows/) 下载，安装时务必勾选 "Add Python to PATH"）。
 
-**第 1 步：安装依赖**
 ```powershell
 python -m pip install -r requirements.txt
-```
-
-**第 2 步：启动程序**
-```powershell
 python main.py
 ```
-脚本会自动下载模型（首次约 999MB）并引导你选择精度。
 
-**首次按 F9 时若 Windows 要求麦克风权限**，去「设置 → 隐私 → 麦克风」打开"允许桌面应用访问麦克风"。
+#### 🐧 Linux 用户指南
 
-> 💡 如果某些以管理员身份运行的软件（如管理员模式的 cmd）粘贴失效，请右键 Python 选择**「以管理员身份运行」**再启动 `main.py`。这是 Windows UAC 的隔离机制，不是程序问题。
+需要调用底层工具实现录音和键盘模拟，**首次运行需要 `sudo` 自动安装系统依赖**（`sox`、`xdotool`、`xclip`）。
+
+**第 1 步：安装系统依赖（仅限首次）**
+```bash
+sudo python3 main.py
+```
+*(系统会自动执行 `apt-get` 安装所需组件)*
+
+**第 2 步：日常启动（切勿使用 sudo）**
+```bash
+python3 main.py
+```
+
+#### 🍎 macOS 用户指南
+
+macOS 需要 `sox` 进行录音。
+
+```bash
+brew install sox
+python3 main.py
+```
 
 ---
 
@@ -123,3 +153,29 @@ python main.py --select
 ## 📝 License
 
 MIT License。本项目衍生自 [EasySenseVoice](https://github.com/fanweichu/EasySenseVoice)，鸣谢原作者 [@fanweichu](https://github.com/fanweichu) 与上游 [SenseVoice](https://github.com/FunAudioLLM/SenseVoice)、[Sherpa-ONNX](https://github.com/k2-fsa/sherpa-onnx) 团队。
+
+---
+
+## 🛠️ 维护者：构建 .exe
+
+本项目已配置 GitHub Actions，**推 `v*` 开头的 tag 会自动在 Windows 环境构建 .exe 并发布到 Release**：
+
+```bash
+git tag v1.0.0
+git push origin v1.0.0
+# 等 ~10 分钟，去 Release 页面看 zip
+```
+
+本地手动构建（需要在 Windows 上）：
+
+```powershell
+pip install -r requirements.txt
+pip install pyinstaller
+pyinstaller build.spec --noconfirm
+# 产物在 dist\OmniSenseVoice\
+```
+
+打包关键点：
+- `build.spec` 用 `collect_all` 收集 sherpa_onnx / sounddevice / numpy 等带原生库的依赖
+- 模型**不打包**进 exe（999MB 太大），首次运行自动下载到 `%APPDATA%\OmniSenseVoice\`
+- 用 OneDir 模式（不是 OneFile），启动快、调试方便
