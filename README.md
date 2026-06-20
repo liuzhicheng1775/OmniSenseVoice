@@ -25,13 +25,27 @@
 2. 解压到任意目录
 3. 双击 `OmniSenseVoice.exe` 运行
 
-首次启动会自动下载模型（约 999MB，存到 `%APPDATA%\OmniSenseVoice\`，只下一次），并让你选择模型精度。
+首次启动会询问你：
+- **模型存储位置**：默认 `%APPDATA%\OmniSenseVoice\sensevoice-models\`，也可以指定自定义目录（如 D 盘空间大的位置）
+- **下载源**（推荐 ModelScope 阿里云，国内最快）：
+  1. ModelScope（阿里云，国内最快）
+  2. HuggingFace Mirror（国内镜像）
+  3. GitHub Releases（原始源，国内可能慢）
+  4. 自定义 URL
+
+模型约 999MB，只下一次，**支持断点续传**（网络中断后重新运行会接着下载）。
 
 **首次按 F9 录音时若 Windows 要求麦克风权限**，去「设置 → 隐私 → 麦克风」打开"允许桌面应用访问麦克风"。
 
 > 💡 如果某些以管理员身份运行的软件（如管理员模式的 cmd）粘贴失效，请右键 `OmniSenseVoice.exe` 选择**「以管理员身份运行」**。这是 Windows UAC 的隔离机制，不是程序问题。
 >
 > ⚠️ 杀软可能误报（因为 PyInstaller 打包 + 全局键盘监听），把 exe 加白名单即可。
+
+#### 🔄 想换模型存储位置或下载源？
+
+删除配置文件后重新运行即可：
+- Windows: 删除 `%APPDATA%\OmniSenseVoice\.sensevoice_config.json`
+- 或者运行 `OmniSenseVoice.exe --select` 重新选模型精度（位置和下载源的选择不会重置）
 
 ### 💻 开发者：从源码运行
 

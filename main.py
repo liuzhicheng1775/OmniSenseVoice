@@ -90,10 +90,12 @@ APP_DATA_DIR = get_app_data_dir()
 APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 BASE_DIR = Path(__file__).parent.absolute()
-MODEL_DIR = APP_DATA_DIR / "sensevoice-models"
 CONFIG_FILE = APP_DATA_DIR / ".sensevoice_config.json"  # 记住上次选择
 AUDIO_FILE = os.path.join(tempfile.gettempdir(), "sensevoice_temp.wav")
 SAMPLE_RATE = 16000
+
+# 模型路径默认放 APP_DATA_DIR，但用户可以在配置文件里指定自定义位置
+# （首次启动会询问，存到 CONFIG_FILE 的 model_dir 字段）
 
 if OS_TYPE == "Darwin":
     REC_BIN = shutil.which("rec") or "/opt/homebrew/bin/rec"
@@ -144,10 +146,6 @@ def check_system_deps():
 # ============================================================
 #  4. 模型配置
 # ============================================================
-MODEL_PACKAGE = {
-    "url": "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17.tar.bz2",
-    "subdir": "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17",
-}
 
 MODEL_OPTIONS = {
     "1": {
@@ -191,21 +189,68 @@ def save_config(data: dict):
 import urllib.request
 import tarfile
 
+# 多个下载源（按速度/可用性排序）
+# 国内用户推荐 ModelScope（阿里）或 HuggingFace mirror
+MODEL_PACKAGE = {
+    "subdir": "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17",
+    "sources": [
+        {
+            "name": "ModelScope（阿里云，国内最快）",
+            "url": "https://www.modelscope.cn/models/iic/SenseVoiceSmall/resolve/master/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17.tar.bz2",
+        },
+        {
+            "name": "HuggingFace Mirror（国内镜像）",
+            "url": "https://hf-mirror.com/k2-fsa/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17/resolve/main/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17.tar.bz2",
+        },
+        {
+            "name": "GitHub Releases（原始源，国内可能慢）",
+            "url": "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17.tar.bz2",
+        },
+    ],
+    "subdir_in_tar": "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17",
+}
 
-def _download_with_progress(url: str, dst: str):
+
+def _download_with_progress(url: str, dst: str, timeout: int = 60, start_time: float = None):
     """
-    用标准库 urllib 下载文件，带进度条。
+    用标准库 urllib 下载文件，带进度条 + 断点续传。
     不依赖 wget/curl，打包成 exe 后也能工作。
+    支持断点续传：如果 dst 已存在部分文件，从已下载位置继续。
     """
-    req = urllib.request.Request(url, headers={"User-Agent": "OmniSenseVoice/2.1"})
-    with urllib.request.urlopen(req) as resp:
-        total = int(resp.headers.get("Content-Length", 0))
-        downloaded = 0
-        chunk = 1024 * 64  # 64 KB
+    if start_time is None:
+        start_time = time.time()
+
+    existing_size = os.path.getsize(dst) if os.path.exists(dst) else 0
+
+    headers = {"User-Agent": "OmniSenseVoice/2.1"}
+    if existing_size > 0:
+        headers["Range"] = f"bytes={existing_size}-"
+
+    req = urllib.request.Request(url, headers=headers)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        # 206 = Partial Content（断点续传成功）
+        # 200 = 服务器不支持 Range，从头下
+        if resp.status == 200 and existing_size > 0:
+            existing_size = 0  # 服务器忽略 Range，从头开始
+
+        total_header = resp.headers.get("Content-Length")
+        total = int(total_header) + existing_size if total_header else 0
+
+        downloaded = existing_size
+        chunk = 1024 * 256  # 256 KB（更大块，提高速度）
         last_pct = -1
-        with open(dst, "wb") as f:
+        mode = "ab" if existing_size > 0 and resp.status == 206 else "wb"
+
+        with open(dst, mode) as f:
             while True:
-                data = resp.read(chunk)
+                try:
+                    data = resp.read(chunk)
+                except Exception as e:
+                    print(f"\n[警告] 网络中断: {e}，已下载 {downloaded / 1024 / 1024:.1f} MB")
+                    print("[*] 重试中...（断点续传，不会从头开始）")
+                    time.sleep(2)
+                    return _download_with_progress(url, dst, timeout, start_time)
+
                 if not data:
                     break
                 f.write(data)
@@ -218,43 +263,154 @@ def _download_with_progress(url: str, dst: str):
                         bar = "█" * filled + "-" * (bar_len - filled)
                         size_mb = downloaded / 1024 / 1024
                         total_mb = total / 1024 / 1024
-                        print(f"\r[{bar}] {pct:3d}%  {size_mb:.1f}/{total_mb:.1f} MB", end="", flush=True)
+                        speed_mb = (downloaded - existing_size) / 1024 / 1024 / max(0.001, time.time() - start_time)
+                        print(f"\r[{bar}] {pct:3d}%  {size_mb:.1f}/{total_mb:.1f} MB  {speed_mb:.1f} MB/s", end="", flush=True)
                         last_pct = pct
         print()  # 换行
+    return downloaded
 
 
-def download_model_package():
+def _choose_download_source(config: dict) -> str:
+    """让用户选下载源"""
+    print("\n[*] 模型包约 999MB，请选择下载源（国内推荐选 1 或 2）：")
+    for i, src in enumerate(MODEL_PACKAGE["sources"], 1):
+        print(f"  {i}. {src['name']}")
+
+    # 自定义 URL 选项
+    print(f"  {len(MODEL_PACKAGE['sources']) + 1}. 自定义 URL（已有镜像/本地 HTTP 服务时用）")
+
+    saved_choice = config.get("download_source")
+    if saved_choice:
+        print(f"\n[上次选择]: {saved_choice}（直接回车使用上次）")
+
+    while True:
+        try:
+            raw = input(f"\n请选择 [1-{len(MODEL_PACKAGE['sources']) + 1}]: ").strip()
+        except EOFError:
+            raw = "1"
+
+        if not raw and saved_choice:
+            # 用上次选择
+            try:
+                idx = int(saved_choice) - 1
+                if 0 <= idx < len(MODEL_PACKAGE["sources"]):
+                    return MODEL_PACKAGE["sources"][idx]["url"]
+            except ValueError:
+                pass
+
+        if not raw:
+            print("[!] 请输入选项")
+            continue
+
+        try:
+            idx = int(raw) - 1
+            if 0 <= idx < len(MODEL_PACKAGE["sources"]):
+                config["download_source"] = raw
+                save_config(config)
+                return MODEL_PACKAGE["sources"][idx]["url"]
+            elif idx == len(MODEL_PACKAGE["sources"]):
+                # 自定义 URL
+                custom = input("请输入完整 URL（指向 .tar.bz2 文件）: ").strip()
+                if custom:
+                    config["download_source"] = raw
+                    config["custom_download_url"] = custom
+                    save_config(config)
+                    return custom
+                else:
+                    print("[!] URL 不能为空")
+                    continue
+        except ValueError:
+            pass
+        print("[!] 无效选择")
+
+
+def _choose_model_dir(config: dict) -> Path:
+    """让用户选择模型存储位置（首次运行时询问）"""
+    default_dir = APP_DATA_DIR / "sensevoice-models"
+    saved_dir = config.get("model_dir")
+
+    if saved_dir and Path(saved_dir).exists():
+        return Path(saved_dir)
+
+    print("\n[*] 选择模型存储位置（模型约 1GB，建议放空间充足的盘）")
+    print(f"  1. 默认位置: {default_dir}")
+    print(f"  2. 自定义位置（输入完整路径）")
+
+    while True:
+        try:
+            choice = input("\n请选择 [1/2]（回车默认 1）: ").strip()
+        except EOFError:
+            choice = "1"
+
+        if not choice or choice == "1":
+            config["model_dir"] = str(default_dir)
+            save_config(config)
+            return default_dir
+        elif choice == "2":
+            try:
+                path = input("请输入目录完整路径（如 D:\\Models\\OmniSenseVoice 或 /home/user/models）: ").strip()
+            except EOFError:
+                path = ""
+            if not path:
+                print("[!] 路径不能为空")
+                continue
+            try:
+                p = Path(path).expanduser().absolute()
+                p.mkdir(parents=True, exist_ok=True)
+                # 测试可写
+                test_file = p / ".write_test"
+                test_file.write_text("test")
+                test_file.unlink()
+                config["model_dir"] = str(p)
+                save_config(config)
+                print(f"[+] 已设置模型存储位置: {p}")
+                return p
+            except Exception as e:
+                print(f"[!] 路径无效或不可写: {e}")
+                continue
+        else:
+            print("[!] 无效选择")
+
+
+def download_model_package(config: dict):
     """下载并解压模型包（含两个模型文件）"""
-    model_path = MODEL_DIR / MODEL_PACKAGE["subdir"]
+    model_dir = _choose_model_dir(config)
+    model_path = model_dir / MODEL_PACKAGE["subdir"]
+
     if model_path.exists():
         return model_path
 
     print(f"\n[*] 需要下载 SenseVoice 模型包（~999MB，含 int8 和原版两个模型）")
-    print(f"    存储位置: {MODEL_DIR}")
+    print(f"    存储位置: {model_dir}")
     input("    按 Enter 开始下载，Ctrl+C 取消...")
 
-    os.makedirs(MODEL_DIR, exist_ok=True)
-    tar_file = str(MODEL_DIR / "model.tar.bz2")
+    os.makedirs(model_dir, exist_ok=True)
+    tar_file = str(model_dir / "model.tar.bz2")
+
+    url = _choose_download_source(config)
 
     try:
-        print(f"[*] 正在从 {MODEL_PACKAGE['url']} 下载...")
-        _download_with_progress(MODEL_PACKAGE["url"], tar_file)
+        print(f"\n[*] 正在下载...")
+        print(f"    URL: {url}")
+        _download_with_progress(url, tar_file)
 
         print("[*] 正在解压模型包...")
         with tarfile.open(tar_file, "r:bz2") as tar:
-            tar.extractall(MODEL_DIR)
+            tar.extractall(model_dir)
         os.remove(tar_file)
         print("[+] 模型包解压完成！\n")
 
     except KeyboardInterrupt:
-        print("\n[!] 下载已取消。")
-        if os.path.exists(tar_file):
-            os.remove(tar_file)
+        print("\n[!] 下载已取消。已下载的部分文件保留在：")
+        print(f"    {tar_file}")
+        print("    下次运行会自动断点续传。")
         sys.exit(0)
     except Exception as e:
         print(f"\n[错误] 下载失败: {e}")
-        print(f"请手动下载: {MODEL_PACKAGE['url']}")
-        print(f"并解压到: {MODEL_DIR}/")
+        print(f"\n[建议] 尝试其他下载源：")
+        for src in MODEL_PACKAGE["sources"]:
+            print(f"  - {src['name']}: {src['url']}")
+        print(f"\n或手动下载 .tar.bz2 文件，解压到: {model_dir}")
         sys.exit(1)
 
     return model_path
@@ -292,7 +448,7 @@ def setup_model(force_select: bool = False):
     config = load_config()
 
     # 确保模型包已下载
-    model_path = download_model_package()
+    model_path = download_model_package(config)
 
     # 判断是否需要重新选择
     saved_choice = config.get("model_choice")
