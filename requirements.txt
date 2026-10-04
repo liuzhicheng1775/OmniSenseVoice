@@ -4,3 +4,7 @@ numpy
 soundfile
 sherpa-onnx
 sounddevice ; sys_platform == "win32"
+
+# GUI 增强（可选）
+pystray>=0.19 ; sys_platform == "win32"
+Pillow>=9.0 ; sys_platform == "win32"
